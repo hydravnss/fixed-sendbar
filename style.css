@@ -1,0 +1,8 @@
+/* Fixed Sendbar - panneau de réglages ; les règles de la barre sont injectées par index.js (<style id="fixed-sendbar-style">) */
+#fixed_sendbar_settings .fs-block { margin: 6px 0; }
+#fixed_sendbar_settings .fs-hint { opacity: 0.7; font-size: 0.85em; margin: 2px 0 4px 0; }
+#fixed_sendbar_settings .fs-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; flex-wrap: wrap; }
+#fixed_sendbar_settings .fs-row input[type="number"] { width: 80px; }
+#fixed_sendbar_settings .fs-row select { flex: 1 1 180px; }
+#fixed_sendbar_settings .fs-row.fs-off { opacity: 0.45; }
+#fixed_sendbar_settings hr { margin: 8px 0; }

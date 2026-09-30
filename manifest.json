@@ -1,0 +1,13 @@
+{
+    "display_name": "Fixed Sendbar",
+    "loading_order": 60,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "hydravnss",
+    "version": "1.0.0",
+    "homePage": "https://github.com/hydravnss/fixed-sendbar",
+    "minimum_client_version": "1.12.0",
+    "description": "FR: Garde la barre d'envoi fixe pendant la saisie multi-lignes (hauteur fixe avec défilement interne, ou croissance vers le haut), corrige le décalage du clavier iOS. EN: Keeps the send bar from moving while typing multiple lines (fixed height with internal scroll, or grow-upward mode) and compensates the iOS keyboard viewport offset."
+}
