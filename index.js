@@ -10,7 +10,10 @@
  *  - CSS très spécifique + !important, injecté dans <style id="fixed-sendbar-style"> (toujours en dernier dans <head>) ;
  *  - JS : à chaque saisie on repose style.height (important) ; un MutationObserver sur l'attribut style rétablit la
  *    hauteur juste après toute modification faite par ST (avant le prochain rendu).
- * iOS : --fs-vv-offset (visualViewport) + translateY sur #form_sheld si la barre est position:fixed (no-op si ~0).
+ * iOS (1.0) : --fs-vv-offset (visualViewport) + translateY sur #form_sheld si la barre est position:fixed (no-op si ~0).
+ * iOS (1.1, « Mode compatibilité iOS renforcé ») : tant que le champ a le focus, la barre est ancrée au bas du
+ *   visualViewport en coordonnées du layout viewport (top = offsetTop + height - hauteurBarre, bottom:auto, inline
+ *   !important) ; boucle rAF (~60 fps) + événements ; la page est ramenée à scrollY = 0 ; retrait des overrides au blur.
  *
  * Vanilla ES module, aucune étape de build.
  * Chemin attendu : /scripts/extensions/third-party/fixed-sendbar/index.js
@@ -27,6 +30,9 @@ const CLS_GROW = 'fs-grow';
 const CLS_GUARD = 'fs-guard';
 const CLS_VV = 'fs-vv';
 const VV_EPSILON = 1; // px : en dessous, décalage considéré nul
+const CLS_IOS = 'fs-ios';
+const LOOP_MIN_MS = 15; // plafond ~60 fps pour la boucle rAF
+const DEBUG_ID = 'fs_debug';
 const SCROLL_GUARD_MS = 1500; // fenêtre après le focus pendant laquelle on surveille le scroll
 
 const MODES = Object.freeze({ fixed: 'fixed', grow: 'grow' });
@@ -39,6 +45,9 @@ const defaultSettings = Object.freeze({
     maxLines: 6, // hauteur max en lignes (mode grow)
     fixIosViewport: true, // « Corriger le décalage clavier iOS »
     guardScroll: true, // remettre window.scrollY à 0 si la page défile pendant la saisie
+    iosStrong: true, // « Mode compatibilité iOS renforcé » : ancrage visualViewport + contre-scroll (boucle rAF)
+    blockScrollIntoView: true, // « Bloquer scrollIntoView du champ » (+ focus() avec preventScroll)
+    debug: false, // « Afficher le debug » : petit overlay de diagnostic
 });
 
 // ---------------------------------------------------------------------------
@@ -115,13 +124,68 @@ function shouldResetScroll(s, focused, scrollY) {
     return !!s.enabled && !!s.guardScroll && !!focused && Number(scrollY) > 0;
 }
 
+/**
+ * Position `top` (px, coordonnées du layout viewport) qui colle le bas de la barre au bas du visualViewport :
+ * top = offsetTop + height - hauteurBarre. null si les entrées sont invalides.
+ */
+function computeAnchorTop(vvOffsetTop, vvHeight, barHeight) {
+    const top = Number(vvOffsetTop) || 0;
+    const h = Number(vvHeight);
+    const b = Number(barHeight);
+    if (!Number.isFinite(h) || !Number.isFinite(b) || b <= 0) return null;
+    return Math.max(0, Math.round(top + h - b));
+}
+
+/**
+ * Décision d'ancrage. m : { innerHeight, vvHeight, vvOffsetTop, vvScale, barHeight, position }.
+ * No-op (apply:false) si réglages OFF, champ sans focus, barre non fixed, zoom pinch, ou écart (gap) ~0
+ * (dans ce cas `bottom:0` du thème est déjà correct).
+ */
+function computeAnchor(s, focused, m) {
+    const none = { apply: false, top: null, gap: 0 };
+    if (!(s && s.enabled && s.iosStrong && focused && m && m.position === 'fixed')) return none;
+    const gap = computeVvOffset(m.innerHeight, m.vvHeight, m.vvOffsetTop, m.vvScale);
+    if (gap < VV_EPSILON) return { apply: false, top: null, gap };
+    const top = computeAnchorTop(m.vvOffsetTop, m.vvHeight, m.barHeight);
+    if (top === null) return { apply: false, top: null, gap };
+    return { apply: true, top, gap };
+}
+
+/** Le contre-scroll renforcé est-il actif ? (mode renforcé + option de blocage du défilement) */
+function shouldCounterScroll(s, focused, scrollY, docTop, bodyTop) {
+    if (!(s && s.enabled && s.iosStrong && s.guardScroll && focused)) return false;
+    return Number(scrollY) !== 0 || Number(docTop) > 0 || Number(bodyTop) > 0;
+}
+
+/** Après Entrée : le curseur est-il en fin de texte (=> faire défiler le champ lui-même vers le bas) ? */
+function shouldStickBottom(selStart, selEnd, length) {
+    return Number(selStart) === Number(length) && Number(selEnd) === Number(length);
+}
+
+/** Bloquer scrollIntoView()/focus() de la page sur le champ d'envoi ? */
+function shouldBlockScroll(s, target, ta, focused, sinceFocusMs) {
+    if (!(s && s.enabled && s.blockScrollIntoView) || !target || target !== ta) return false;
+    return !!focused || Number(sinceFocusMs) < SCROLL_GUARD_MS;
+}
+
+/** Texte de l'overlay de debug. d : { scrollY, vvTop, vvHeight, innerHeight, barTop, barBottom, anchored, anchorTop, gap, focused }. */
+function formatDebug(d) {
+    const n = (v) => (Number.isFinite(Number(v)) ? String(Math.round(Number(v) * 10) / 10) : '?');
+    return [
+        `scrollY ${n(d.scrollY)}  inner ${n(d.innerHeight)}`,
+        `vv.top ${n(d.vvTop)}  vv.h ${n(d.vvHeight)}`,
+        `bar top ${n(d.barTop)}  bot ${n(d.barBottom)}`,
+        `focus ${d.focused ? 1 : 0}  anchor ${d.anchored ? n(d.anchorTop) : '-'}  gap ${n(d.gap)}`,
+    ].join('\n');
+}
+
 /** Règles CSS (spécificité gonflée par :not(#id) pour battre le thème « iMessage Dark »). */
 function buildCss(s) {
     const spec = ':not(#fs_s1):not(#fs_s2)';
     const on = `html.${CLS_ON}`;
     const ta = `html.${CLS_ON} body #send_textarea${spec}`;
     const rules = [];
-    const common = 'resize:none !important;overflow-y:auto !important;overflow-x:hidden !important;'
+    const common = 'scroll-padding:0 !important;resize:none !important;overflow-y:auto !important;overflow-x:hidden !important;'
         + '-webkit-overflow-scrolling:touch;overscroll-behavior:contain;box-sizing:border-box !important;';
     if (s.mode === MODES.grow) {
         rules.push(`${ta} {min-height:var(--fs-min-h, 2em) !important;max-height:var(--fs-max-h, 9em) !important;${common}}`);
@@ -134,6 +198,9 @@ function buildCss(s) {
     // Pas d'ancrage de défilement automatique du navigateur sur la barre
     rules.push(`${on} body #form_sheld${spec} {overflow-anchor:none;}`);
     rules.push(`html.${CLS_ON}.${CLS_GUARD}, html.${CLS_ON}.${CLS_GUARD} body {overscroll-behavior:none !important;}`);
+    // Mode iOS renforcé : pas de rebond / chaînage de scroll ; height:100% à spécificité 0 (:where) pour ne jamais écraser le thème / ST
+    rules.push(`html.${CLS_ON}.${CLS_IOS}, html.${CLS_ON}.${CLS_IOS} body {overscroll-behavior:none !important;}`);
+    rules.push(`:where(html.${CLS_ON}.${CLS_IOS}, html.${CLS_ON}.${CLS_IOS} body) {height:100%;}`);
     // Décalage clavier iOS : uniquement quand la classe fs-vv est posée par index.js (barre fixed + offset > 0)
     rules.push(`html.${CLS_ON}.${CLS_VV} body #form_sheld${spec} {transform:translateY(calc(-1 * var(--fs-vv-offset, 0px))) !important;}`);
     return rules.join('\n');
@@ -159,7 +226,7 @@ function getSettings() {
     for (const [key, value] of Object.entries(defaultSettings)) {
         if (s[key] === undefined) s[key] = value; // fusion des valeurs par défaut
     }
-    for (const k of ['enabled', 'fixIosViewport', 'guardScroll']) s[k] = !!s[k];
+    for (const k of ['enabled', 'fixIosViewport', 'guardScroll', 'iosStrong', 'blockScrollIntoView', 'debug']) s[k] = !!s[k];
     if (s.mode !== MODES.fixed && s.mode !== MODES.grow) s.mode = MODES.fixed;
     s.visibleLines = clampNumber(s.visibleLines, defaultSettings.visibleLines, 1, 12);
     s.heightPx = clampNumber(s.heightPx, 0, 0, 600);
@@ -189,6 +256,19 @@ let observedTa = null;
 let listenersBound = false;
 let focusedAt = 0;
 let vvRaf = 0;
+let taFocused = false;
+let anchored = false;
+let anchorTop = null;
+let lastGap = 0;
+let savedInline = null;
+let loopId = 0;
+let lastTick = 0;
+
+const isFocused = () => {
+    if (taFocused) return true;
+    const ta = getTextarea();
+    return !!ta && document.activeElement === ta;
+};
 
 function readMetrics(ta) {
     const cs = getComputedStyle(ta);
@@ -217,6 +297,7 @@ function applyStyle() {
         r.classList.toggle(CLS_ON, !!s.enabled);
         r.classList.toggle(CLS_GROW, !!s.enabled && s.mode === MODES.grow);
         r.classList.toggle(CLS_GUARD, !!s.enabled && !!s.guardScroll);
+        r.classList.toggle(CLS_IOS, !!s.enabled && !!s.iosStrong);
     } catch (e) { console.error(LOG, e); }
 }
 
@@ -266,6 +347,10 @@ function releaseHeight() {
     const r = root();
     for (const v of ['--fs-h', '--fs-min-h', '--fs-max-h', '--fs-vv-offset']) r.style.removeProperty(v);
     r.classList.remove(CLS_VV);
+    r.classList.remove(CLS_IOS);
+    releaseAnchor();
+    stopLoop();
+    updateDebug();
 }
 
 function observeTextarea() {
@@ -288,7 +373,8 @@ function updateVv() {
         const sheld = getSheld();
         let offset = 0;
         let position = '';
-        if (s.enabled && s.fixIosViewport && vv && sheld) {
+        // Mode renforcé : l'ancrage top/bottom remplace l'ancienne translation (sinon double décalage)
+        if (s.enabled && s.fixIosViewport && !s.iosStrong && vv && sheld) {
             offset = computeVvOffset(globalThis.innerHeight, vv.height, vv.offsetTop, vv.scale);
             position = getComputedStyle(sheld).position;
         }
@@ -308,6 +394,200 @@ function scheduleVv() {
     vvRaf = raf(() => { vvRaf = 0; updateVv(); });
 }
 
+// --- iOS renforcé : ancrage visualViewport + contre-scroll ---------------------
+
+function getPageScrollY() {
+    const y = Number(globalThis.scrollY ?? globalThis.pageYOffset);
+    return Number.isFinite(y) ? y : 0;
+}
+
+/** Ramène la page à 0 (window + html + body) si elle a bougé. Retourne true si une correction a eu lieu. */
+function resetPageScroll() {
+    try {
+        const de = document.documentElement;
+        const b = document.body;
+        const y = getPageScrollY();
+        const dt = de ? de.scrollTop : 0;
+        const bt = b ? b.scrollTop : 0;
+        if (y === 0 && !(dt > 0) && !(bt > 0)) return false;
+        if (typeof globalThis.scrollTo === 'function') globalThis.scrollTo(0, 0);
+        if (de && de.scrollTop !== 0) de.scrollTop = 0;
+        if (b && b.scrollTop !== 0) b.scrollTop = 0;
+        return true;
+    } catch (e) { return false; }
+}
+
+function applyAnchor(sheld, top) {
+    const st = sheld.style;
+    if (!anchored) {
+        savedInline = {
+            top: [st.getPropertyValue('top'), st.getPropertyPriority('top')],
+            bottom: [st.getPropertyValue('bottom'), st.getPropertyPriority('bottom')],
+        };
+        anchored = true;
+    }
+    anchorTop = top;
+    const want = `${top}px`;
+    if (st.getPropertyValue('top') !== want || st.getPropertyPriority('top') !== 'important') st.setProperty('top', want, 'important');
+    if (st.getPropertyValue('bottom') !== 'auto' || st.getPropertyPriority('bottom') !== 'important') st.setProperty('bottom', 'auto', 'important');
+}
+
+/** Retire l'override inline (le `bottom:0 !important` du thème s'applique de nouveau). */
+function releaseAnchor() {
+    if (!anchored) return;
+    anchored = false;
+    anchorTop = null;
+    const sheld = getSheld();
+    const saved = savedInline;
+    savedInline = null;
+    if (!sheld) return;
+    for (const prop of ['top', 'bottom']) {
+        const [val, prio] = (saved && saved[prop]) || ['', ''];
+        if (val) sheld.style.setProperty(prop, val, prio || '');
+        else sheld.style.removeProperty(prop);
+    }
+}
+
+/** Calcule et applique (ou retire) l'ancrage. Appelée par les événements et par la boucle rAF. */
+function updateAnchor() {
+    try {
+        const s = getSettings();
+        const vv = globalThis.visualViewport;
+        const sheld = getSheld();
+        const focused = isFocused();
+        if (!(s.enabled && s.iosStrong && focused && sheld && vv)) {
+            releaseAnchor();
+            lastGap = 0;
+        } else {
+            if (s.guardScroll) resetPageScroll();
+            const m = {
+                innerHeight: globalThis.innerHeight,
+                vvHeight: vv.height,
+                vvOffsetTop: vv.offsetTop,
+                vvScale: vv.scale,
+                barHeight: sheld.offsetHeight,
+                position: getComputedStyle(sheld).position,
+            };
+            const a = computeAnchor(s, focused, m);
+            lastGap = a.gap;
+            if (a.apply) applyAnchor(sheld, a.top);
+            else releaseAnchor();
+        }
+        updateDebug();
+    } catch (e) { console.error(LOG, 'updateAnchor a échoué', e); }
+}
+
+function stopLoop() {
+    if (!loopId) return;
+    const caf = globalThis.cancelAnimationFrame || clearTimeout;
+    try { caf(loopId); } catch (e) { /* ignore */ }
+    loopId = 0;
+}
+
+/** Boucle rAF (plafonnée ~60 fps) tant que le champ a le focus ; s'arrête au blur. */
+function startLoop() {
+    if (loopId) return;
+    const raf = globalThis.requestAnimationFrame || ((f) => setTimeout(() => f(Date.now()), 16));
+    const step = (ts) => {
+        loopId = 0;
+        const s = getSettings();
+        if (!(s.enabled && s.iosStrong && isFocused())) { updateAnchor(); return; }
+        const now = Number.isFinite(ts) ? ts : Date.now();
+        if (now - lastTick >= LOOP_MIN_MS || now < lastTick) {
+            lastTick = now;
+            updateAnchor();
+        }
+        loopId = raf(step);
+    };
+    loopId = raf(step);
+}
+
+/** Après Entrée (action par défaut faite) : garder le curseur visible en faisant défiler le champ seulement. */
+function keepCaretVisible() {
+    try {
+        const s = getSettings();
+        const ta = getTextarea();
+        if (!s.enabled || !ta) return;
+        if (shouldStickBottom(ta.selectionStart, ta.selectionEnd, ta.value.length)) ta.scrollTop = ta.scrollHeight;
+        if (s.iosStrong && s.guardScroll) resetPageScroll();
+        updateAnchor();
+    } catch (e) { console.error(LOG, 'keepCaretVisible a échoué', e); }
+}
+
+/**
+ * Enveloppes (une seule fois) de Element.prototype.scrollIntoView et HTMLElement.prototype.focus : uniquement pour
+ * #send_textarea et seulement si le réglage est ON ; tout le reste passe par l'original. Tout est dans try/catch.
+ */
+function installScrollPatches() {
+    try {
+        const E = globalThis.Element;
+        if (E && E.prototype && typeof E.prototype.scrollIntoView === 'function' && !E.prototype.scrollIntoView.__fsPatched) {
+            const orig = E.prototype.scrollIntoView;
+            const wrapped = function (...args) {
+                try {
+                    if (shouldBlockScroll(getSettings(), this, getTextarea(), isFocused(), Date.now() - focusedAt)) return undefined;
+                } catch (e) { /* ignore : on retombe sur l'original */ }
+                return orig.apply(this, args);
+            };
+            wrapped.__fsPatched = true;
+            E.prototype.scrollIntoView = wrapped;
+        }
+    } catch (e) { console.warn(LOG, 'patch scrollIntoView impossible', e); }
+    try {
+        const H = globalThis.HTMLElement;
+        if (H && H.prototype && typeof H.prototype.focus === 'function' && !H.prototype.focus.__fsPatched) {
+            const origFocus = H.prototype.focus;
+            const wrappedFocus = function (...args) {
+                try {
+                    const s = getSettings();
+                    if (s.enabled && s.blockScrollIntoView && this === getTextarea()) {
+                        args[0] = Object.assign({}, args[0], { preventScroll: true });
+                    }
+                } catch (e) { /* ignore */ }
+                return origFocus.apply(this, args);
+            };
+            wrappedFocus.__fsPatched = true;
+            H.prototype.focus = wrappedFocus;
+        }
+    } catch (e) { console.warn(LOG, 'patch focus impossible', e); }
+}
+
+// --- Debug ------------------------------------------------------------------
+
+function updateDebug() {
+    try {
+        const s = getSettings();
+        let el = document.getElementById(DEBUG_ID);
+        if (!s.debug) {
+            if (el) el.remove();
+            return;
+        }
+        if (!el) {
+            el = document.createElement('div');
+            el.id = DEBUG_ID;
+            el.style.cssText = 'position:fixed;top:2px;left:2px;z-index:2147483647;pointer-events:none;'
+                + 'background:rgba(0,0,0,.75);color:#0f0;font:10px/1.3 monospace;padding:2px 4px;border-radius:3px;'
+                + 'white-space:pre;transform:none;';
+            (document.body || document.documentElement).appendChild(el);
+        }
+        const vv = globalThis.visualViewport;
+        const sheld = getSheld();
+        const rect = sheld ? sheld.getBoundingClientRect() : { top: NaN, bottom: NaN };
+        el.textContent = formatDebug({
+            scrollY: getPageScrollY(),
+            vvTop: vv ? vv.offsetTop : NaN,
+            vvHeight: vv ? vv.height : NaN,
+            innerHeight: globalThis.innerHeight,
+            barTop: rect.top,
+            barBottom: rect.bottom,
+            anchored,
+            anchorTop,
+            gap: lastGap,
+            focused: isFocused(),
+        });
+    } catch (e) { /* le debug ne doit jamais gêner */ }
+}
+
 // --- Écouteurs --------------------------------------------------------------
 
 function refreshAll() {
@@ -315,6 +595,9 @@ function refreshAll() {
     observeTextarea();
     enforce();
     scheduleVv();
+    installScrollPatches();
+    updateAnchor();
+    if (isFocused() && getSettings().iosStrong) startLoop();
 }
 
 function bindListeners() {
@@ -329,42 +612,61 @@ function bindListeners() {
         enforce();
         Promise.resolve().then(enforce);
         setTimeout(enforce, 0);
+        updateAnchor();
     };
     for (const type of ['input', 'keyup', 'change', 'cut', 'paste', 'compositionend']) {
         document.addEventListener(type, onInput, true);
     }
     document.addEventListener('keydown', (e) => {
-        if (isTa(e.target) && e.key === 'Enter') setTimeout(enforce, 0);
+        if (!isTa(e.target)) return;
+        updateAnchor();
+        if (e.key === 'Enter') {
+            setTimeout(enforce, 0);
+            // Après l'action par défaut (insertion du saut de ligne) : défiler le champ, pas la page
+            setTimeout(keepCaretVisible, 0);
+            const raf = globalThis.requestAnimationFrame;
+            if (typeof raf === 'function') raf(() => keepCaretVisible());
+        }
     }, true);
+    document.addEventListener('selectionchange', () => { if (taFocused) updateAnchor(); });
     document.addEventListener('click', (e) => {
         if (e.target && e.target.closest && e.target.closest('#send_but')) { setTimeout(enforce, 60); setTimeout(enforce, 300); }
     }, true);
     document.addEventListener('focusin', (e) => {
         if (!isTa(e.target)) return;
         focusedAt = Date.now();
+        taFocused = true;
         observeTextarea();
         enforce();
         scheduleVv();
+        updateAnchor();
+        if (getSettings().iosStrong) startLoop();
     });
     document.addEventListener('focusout', (e) => {
         if (!isTa(e.target)) return;
+        taFocused = false;
+        stopLoop();
+        releaseAnchor(); // le `bottom:0 !important` du thème s'applique de nouveau
+        updateDebug();
         setTimeout(() => { enforce(); scheduleVv(); }, 100);
     });
     globalThis.addEventListener('resize', () => { enforce(); scheduleVv(); });
     globalThis.addEventListener('orientationchange', () => setTimeout(() => { enforce(); scheduleVv(); }, 250));
     // Garde-fou de défilement : si la page défile alors que le champ a le focus, on revient à 0.
     globalThis.addEventListener('scroll', () => {
-        const ta = getTextarea();
-        const focused = !!ta && document.activeElement === ta;
+        const focused = isFocused();
         if (shouldResetScroll(getSettings(), focused, globalThis.scrollY)) {
             globalThis.scrollTo(0, 0);
         }
+        updateAnchor();
         scheduleVv();
     }, { passive: true });
     if (globalThis.visualViewport) {
-        globalThis.visualViewport.addEventListener('resize', () => { scheduleVv(); });
-        globalThis.visualViewport.addEventListener('scroll', () => { scheduleVv(); });
+        globalThis.visualViewport.addEventListener('resize', () => { updateAnchor(); scheduleVv(); });
+        globalThis.visualViewport.addEventListener('scroll', () => { updateAnchor(); scheduleVv(); });
     }
+    taFocused = !!getTextarea() && document.activeElement === getTextarea();
+    if (taFocused) startLoop();
     if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => enforce()).catch(() => {});
 }
 
@@ -405,12 +707,24 @@ function buildSettingsHtml() {
         <input type="number" id="fs_max" class="text_pole" min="1" max="30" step="1">
       </div>
       <div class="fs-block">
-        <label class="checkbox_label"><input type="checkbox" id="fs_vv"><span>Corriger le décalage clavier iOS</span></label>
-        <div class="fs-hint">Ancre la barre au bas de la zone visible (visualViewport) quand le clavier s'ouvre. Sans effet si le décalage est nul ou si la barre n'est pas en position fixe.</div>
+        <label class="checkbox_label"><input type="checkbox" id="fs_ios"><span>Mode compatibilité iOS renforcé</span></label>
+        <div class="fs-hint">Pendant la saisie (clavier ouvert), ancre la barre au bas de la zone visible (visualViewport : <code>top</code> calculé, <code>bottom:auto</code>) et ramène la page à 0, à chaque événement et à ~60 images/s. Au blur, le <code>bottom:0</code> de votre CSS s'applique de nouveau. Remplace l'ancienne translation ci-dessous.</div>
+      </div>
+      <div class="fs-block">
+        <label class="checkbox_label"><input type="checkbox" id="fs_vv"><span>Corriger le décalage clavier iOS (ancienne méthode)</span></label>
+        <div class="fs-hint">Translation de la barre selon visualViewport ; utilisée seulement si le mode renforcé est désactivé. Sans effet si le décalage est nul ou si la barre n'est pas en position fixe.</div>
       </div>
       <div class="fs-block">
         <label class="checkbox_label"><input type="checkbox" id="fs_guard"><span>Bloquer le défilement de la page pendant la saisie</span></label>
-        <div class="fs-hint">Remet la page à 0 si elle défile alors que le champ a le focus.</div>
+        <div class="fs-hint">Remet la page à 0 (window, html, body) si elle défile alors que le champ a le focus.</div>
+      </div>
+      <div class="fs-block">
+        <label class="checkbox_label"><input type="checkbox" id="fs_sib"><span>Bloquer scrollIntoView du champ</span></label>
+        <div class="fs-hint">Ignore les <code>scrollIntoView()</code> visant #send_textarea pendant la saisie et appelle <code>focus()</code> avec <code>preventScroll</code> sur ce champ uniquement.</div>
+      </div>
+      <div class="fs-block">
+        <label class="checkbox_label"><input type="checkbox" id="fs_debug"><span>Afficher le debug</span></label>
+        <div class="fs-hint">Petit overlay en haut à gauche (scrollY, visualViewport, position de la barre) à capturer en screenshot pour le diagnostic.</div>
       </div>
       <hr>
       <div class="menu_button" id="fs_reset">Réinitialiser les réglages</div>
@@ -429,6 +743,9 @@ function syncUi() {
     $('#fs_max').val(s.maxLines);
     $('#fs_vv').prop('checked', s.fixIosViewport);
     $('#fs_guard').prop('checked', s.guardScroll);
+    $('#fs_ios').prop('checked', s.iosStrong);
+    $('#fs_sib').prop('checked', s.blockScrollIntoView);
+    $('#fs_debug').prop('checked', s.debug);
     const grow = s.mode === MODES.grow;
     $('#fs_row_lines, #fs_row_px').toggleClass('fs-off', grow);
     $('#fs_row_max').toggleClass('fs-off', !grow);
@@ -449,6 +766,13 @@ function bindUi() {
     $('#fs_max').on('input change', function () { s.maxLines = clampNumber($(this).val(), defaultSettings.maxLines, 1, 30); saveSettings(); refreshAll(); });
     $('#fs_vv').on('change', function () { s.fixIosViewport = !!$(this).prop('checked'); saveSettings(); updateVv(); });
     $('#fs_guard').on('change', function () { s.guardScroll = !!$(this).prop('checked'); saveSettings(); applyStyle(); });
+    $('#fs_ios').on('change', function () {
+        s.iosStrong = !!$(this).prop('checked'); saveSettings(); applyStyle();
+        if (s.iosStrong) { if (isFocused()) startLoop(); } else { stopLoop(); releaseAnchor(); }
+        updateAnchor(); updateVv();
+    });
+    $('#fs_sib').on('change', function () { s.blockScrollIntoView = !!$(this).prop('checked'); saveSettings(); });
+    $('#fs_debug').on('change', function () { s.debug = !!$(this).prop('checked'); saveSettings(); updateDebug(); });
     $('#fs_reset').on('click', () => {
         try {
             stExtensions.extension_settings[MODULE_NAME] = {};
@@ -487,6 +811,8 @@ function init() {
         observeTextarea();
         enforce();
         updateVv();
+        installScrollPatches();
+        updateDebug();
         // Un autre thème/extension peut injecter son CSS plus tard : on se remet en dernier dans <head>.
         setTimeout(refreshAll, 1500);
         setTimeout(refreshAll, 4000);
@@ -514,5 +840,7 @@ if (globalThis.jQuery) {
 export const __test = {
     MODES, defaultSettings, clampNumber, parseLineHeight, heightForLines, computeFixedHeight, computeGrowHeight,
     computeTargetHeight, computeVvOffset, shouldApplyVv, shouldResetScroll, buildCss, braceBalance,
+    computeAnchorTop, computeAnchor, shouldCounterScroll, shouldStickBottom, shouldBlockScroll, formatDebug,
     getSettings, applyStyle, enforce, updateVv, observeTextarea, releaseHeight,
+    updateAnchor, releaseAnchor, resetPageScroll, keepCaretVisible, installScrollPatches, updateDebug, startLoop, stopLoop,
 };

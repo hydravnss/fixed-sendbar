@@ -20,7 +20,16 @@ globalThis.window = dom.window;
 globalThis.document = dom.window.document;
 globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
 globalThis.MutationObserver = dom.window.MutationObserver;
-globalThis.addEventListener = () => {};
+const winHandlers = {};
+globalThis.addEventListener = (type, fn) => { (winHandlers[type] ||= []).push(fn); };
+const fire = (type) => (winHandlers[type] || []).forEach((f) => f({ type }));
+globalThis.scrollY = 0;
+globalThis.scrollTo = (x, y) => { globalThis.scrollY = y; };
+globalThis.innerHeight = 800;
+let rafQueue = [];
+globalThis.requestAnimationFrame = (f) => { rafQueue.push(f); return rafQueue.length; };
+globalThis.cancelAnimationFrame = () => {};
+const runRaf = (ts) => { const q = rafQueue; rafQueue = []; q.forEach((f) => f(ts)); };
 const { __test: t } = await import(pathToFileURL(path.join(extDir, 'index.js')).href);
 
 let n = 0;
@@ -36,6 +45,9 @@ ok('defaults merge + sanitisation', () => {
     assert.equal(s.maxLines, 6);
     assert.equal(s.fixIosViewport, true);
     assert.equal(s.guardScroll, true);
+    assert.equal(s.iosStrong, true);
+    assert.equal(s.blockScrollIntoView, true);
+    assert.equal(s.debug, false);
     Object.assign(s, { visibleLines: 3 });
 });
 
@@ -147,7 +159,8 @@ ok('désactivation : relâche la hauteur et les variables', () => {
     s.enabled = true; t.applyStyle();
 });
 
-ok('updateVv : no-op sans visualViewport, appliqué avec', () => {
+ok('updateVv (ancienne méthode, iosStrong OFF) : no-op sans visualViewport, appliqué avec', () => {
+    t.getSettings().iosStrong = false;
     t.updateVv();
     assert.ok(!document.documentElement.classList.contains('fs-vv'));
     globalThis.innerHeight = 800;
@@ -165,6 +178,192 @@ ok('updateVv : no-op sans visualViewport, appliqué avec', () => {
     document.getElementById('form_sheld').style.position = 'static';
     t.updateVv();
     assert.ok(!document.documentElement.classList.contains('fs-vv'), 'non fixed => no-op');
+    t.getSettings().iosStrong = true;
+    t.updateVv();
+    assert.ok(!document.documentElement.classList.contains('fs-vv'), 'mode renforcé : plus de translation');
+    document.getElementById('form_sheld').style.position = '';
+    globalThis.visualViewport = undefined;
+});
+
+// --- 1.1.0 : fonctions pures ---
+ok('computeAnchorTop : clavier ouvert, offsets', () => {
+    assert.equal(t.computeAnchorTop(0, 500, 80), 420);
+    assert.equal(t.computeAnchorTop(120, 500, 80), 540); // page décalée de 120px
+    assert.equal(t.computeAnchorTop(undefined, 500, 80), 420);
+    assert.equal(t.computeAnchorTop(0, 500, 0), null);
+    assert.equal(t.computeAnchorTop(0, NaN, 80), null);
+    assert.equal(t.computeAnchorTop(0, 50, 80), 0); // jamais négatif
+    assert.equal(t.computeAnchorTop(0.4, 500.4, 80.2), 421);
+});
+
+ok('computeAnchor : no-op si offset ~0, non fixed, sans focus, réglage OFF, zoom', () => {
+    const s = { enabled: true, iosStrong: true };
+    const m = { innerHeight: 800, vvHeight: 500, vvOffsetTop: 0, vvScale: 1, barHeight: 90, position: 'fixed' };
+    assert.deepEqual(t.computeAnchor(s, true, m), { apply: true, top: 410, gap: 300 });
+    assert.equal(t.computeAnchor(s, true, { ...m, vvOffsetTop: 100 }).top, 510);
+    assert.equal(t.computeAnchor(s, true, { ...m, vvOffsetTop: 100 }).gap, 200);
+    assert.equal(t.computeAnchor(s, true, { ...m, vvHeight: 800 }).apply, false);
+    assert.equal(t.computeAnchor(s, true, { ...m, vvHeight: 799.5 }).apply, false);
+    assert.equal(t.computeAnchor(s, false, m).apply, false);
+    assert.equal(t.computeAnchor(s, true, { ...m, position: 'static' }).apply, false);
+    assert.equal(t.computeAnchor({ ...s, iosStrong: false }, true, m).apply, false);
+    assert.equal(t.computeAnchor({ ...s, enabled: false }, true, m).apply, false);
+    assert.equal(t.computeAnchor(s, true, { ...m, vvScale: 2 }).apply, false);
+    assert.equal(t.computeAnchor(s, true, { ...m, barHeight: 0 }).apply, false);
+});
+
+ok('shouldCounterScroll / shouldStickBottom / shouldBlockScroll / formatDebug', () => {
+    const s = { enabled: true, iosStrong: true, guardScroll: true, blockScrollIntoView: true };
+    assert.equal(t.shouldCounterScroll(s, true, 30, 0, 0), true);
+    assert.equal(t.shouldCounterScroll(s, true, 0, 12, 0), true);
+    assert.equal(t.shouldCounterScroll(s, true, 0, 0, 0), false);
+    assert.equal(t.shouldCounterScroll(s, false, 30, 0, 0), false);
+    assert.equal(t.shouldCounterScroll({ ...s, guardScroll: false }, true, 30, 0, 0), false);
+    assert.equal(t.shouldCounterScroll({ ...s, iosStrong: false }, true, 30, 0, 0), false);
+    assert.equal(t.shouldStickBottom(5, 5, 5), true);
+    assert.equal(t.shouldStickBottom(2, 2, 5), false);
+    assert.equal(t.shouldStickBottom(0, 5, 5), false);
+    const a = {}, b = {};
+    assert.equal(t.shouldBlockScroll(s, a, a, true, 99999), true);
+    assert.equal(t.shouldBlockScroll(s, a, a, false, 100), true);
+    assert.equal(t.shouldBlockScroll(s, a, a, false, 99999), false);
+    assert.equal(t.shouldBlockScroll(s, b, a, true, 0), false);
+    assert.equal(t.shouldBlockScroll({ ...s, blockScrollIntoView: false }, a, a, true, 0), false);
+    const txt = t.formatDebug({ scrollY: 12, vvTop: 3.25, vvHeight: 500, innerHeight: 800, barTop: 410, barBottom: 500, anchored: true, anchorTop: 410, gap: 300, focused: true });
+    assert.match(txt, /scrollY 12/); assert.match(txt, /vv\.top 3\.3/); assert.match(txt, /bot 500/); assert.match(txt, /anchor 410/);
+    assert.match(t.formatDebug({}), /scrollY \?/);
+});
+
+ok('buildCss 1.1 : scroll-padding, overscroll-behavior, pas de position:fixed sur html/body', () => {
+    for (const mode of ['fixed', 'grow']) {
+        const css = t.buildCss({ mode });
+        assert.ok(t.braceBalance(css));
+        assert.match(css, /scroll-padding:0 !important/);
+        assert.match(css, /fs-ios[^{]*\{overscroll-behavior:none !important/);
+        assert.match(css, /height:100%/);
+        assert.ok(!/position\s*:\s*fixed/.test(css), 'pas de position:fixed');
+        assert.ok(!/inset\s*:/.test(css));
+    }
+});
+
+// --- 1.1.0 : câblage des événements (jsdom) ---
+const sheld = document.getElementById('form_sheld');
+Object.defineProperty(sheld, 'offsetHeight', { configurable: true, get: () => 90 });
+const fireDoc = (type, target, extra = {}) => {
+    const ev = new dom.window.Event(type, { bubbles: true, cancelable: true });
+    Object.assign(ev, extra);
+    target.dispatchEvent(ev);
+};
+
+ok('focus : top inline !important + bottom:auto ; blur : override retiré, bottom:0 du thème', () => {
+    const s = t.getSettings(); s.enabled = true; s.iosStrong = true; s.guardScroll = true; s.mode = 'fixed';
+    sheld.style.cssText = 'position:fixed;bottom:0';
+    globalThis.innerHeight = 800;
+    globalThis.visualViewport = { height: 500, offsetTop: 0, scale: 1, addEventListener() {} };
+    ta.focus();
+    fireDoc('focusin', ta);
+    assert.equal(sheld.style.getPropertyValue('top'), '410px');
+    assert.equal(sheld.style.getPropertyPriority('top'), 'important');
+    assert.equal(sheld.style.getPropertyValue('bottom'), 'auto');
+    assert.equal(sheld.style.getPropertyPriority('bottom'), 'important');
+    // la page a glissé (iOS) : offsetTop change => top suit
+    globalThis.visualViewport = { height: 450, offsetTop: 60, scale: 1, addEventListener() {} };
+    fire('scroll');
+    assert.equal(sheld.style.getPropertyValue('top'), '420px');
+    // clavier refermé / offset nul => no-op (override retiré)
+    globalThis.visualViewport = { height: 800, offsetTop: 0, scale: 1, addEventListener() {} };
+    fire('scroll');
+    assert.equal(sheld.style.getPropertyValue('top'), '');
+    assert.equal(sheld.style.getPropertyValue('bottom'), '0px');
+    // de nouveau clavier ouvert puis blur
+    globalThis.visualViewport = { height: 500, offsetTop: 0, scale: 1, addEventListener() {} };
+    fire('scroll');
+    assert.equal(sheld.style.getPropertyValue('top'), '410px');
+    ta.blur();
+    fireDoc('focusout', ta);
+    assert.equal(sheld.style.getPropertyValue('top'), '');
+    assert.equal(sheld.style.getPropertyValue('bottom'), '0px', 'bottom:0 d\'origine restauré');
+    assert.equal(sheld.style.getPropertyValue('position'), 'fixed');
+});
+
+ok('scroll reset : scroll window => scrollTo(0,0) ; sans focus => intact', () => {
+    const ta2 = document.getElementById('send_textarea');
+    ta2.focus(); fireDoc('focusin', ta2);
+    globalThis.scrollY = 120;
+    document.documentElement.scrollTop = 120;
+    fire('scroll');
+    assert.equal(globalThis.scrollY, 0);
+    globalThis.scrollY = 50;
+    assert.equal(t.resetPageScroll(), true);
+    assert.equal(globalThis.scrollY, 0);
+    assert.equal(t.resetPageScroll(), false);
+    ta2.blur(); fireDoc('focusout', ta2);
+    globalThis.scrollY = 77;
+    fire('scroll');
+    assert.equal(globalThis.scrollY, 77, 'pas de reset sans focus');
+    globalThis.scrollY = 0;
+});
+
+ok('boucle rAF : repositionne tant que focus, s\'arrête au blur', () => {
+    const ta2 = document.getElementById('send_textarea');
+    globalThis.visualViewport = { height: 500, offsetTop: 0, scale: 1, addEventListener() {} };
+    rafQueue = [];
+    ta2.focus(); fireDoc('focusin', ta2);
+    assert.ok(rafQueue.length >= 1, 'boucle démarrée');
+    globalThis.visualViewport = { height: 480, offsetTop: 0, scale: 1, addEventListener() {} };
+    runRaf(10000);
+    assert.equal(sheld.style.getPropertyValue('top'), '390px');
+    assert.ok(rafQueue.length >= 1, 'boucle continue');
+    ta2.blur(); fireDoc('focusout', ta2);
+    runRaf(20000);
+    assert.equal(rafQueue.length, 0, 'boucle arrêtée après blur');
+    assert.equal(sheld.style.getPropertyValue('top'), '');
+});
+
+ok('Enter : défilement interne du champ, page remise à 0', () => {
+    const ta2 = document.getElementById('send_textarea');
+    ta2.focus(); fireDoc('focusin', ta2);
+    ta2.value = 'a\nb\nc\n';
+    ta2.setSelectionRange(ta2.value.length, ta2.value.length);
+    stub(600);
+    globalThis.scrollY = 40;
+    fireDoc('keydown', ta2, { key: 'Enter' });
+    t.keepCaretVisible();
+    assert.equal(ta2.scrollTop, 600);
+    assert.equal(globalThis.scrollY, 0);
+    ta2.blur(); fireDoc('focusout', ta2);
+});
+
+ok('scrollIntoView / focus : bloqués pour #send_textarea seulement', () => {
+    const calls = [];
+    dom.window.Element.prototype.scrollIntoView = function () { calls.push(this.id || this.tagName); };
+    globalThis.Element = dom.window.Element;
+    globalThis.HTMLElement = dom.window.HTMLElement;
+    const seen = [];
+    const origFocus = dom.window.HTMLElement.prototype.focus;
+    dom.window.HTMLElement.prototype.focus = function (opts) { seen.push(opts); return origFocus.call(this); };
+    t.installScrollPatches();
+    const ta2 = document.getElementById('send_textarea');
+    const other = document.getElementById('nonQRFormItems');
+    ta2.scrollIntoView(); // focus récent ou actif => bloqué
+    other.scrollIntoView(); // autre élément => passe
+    assert.deepEqual(calls, ['nonQRFormItems']);
+    t.getSettings().blockScrollIntoView = false;
+    ta2.scrollIntoView();
+    assert.deepEqual(calls, ['nonQRFormItems', 'send_textarea']);
+    t.getSettings().blockScrollIntoView = true;
+    ta2.focus();
+    assert.equal(seen.at(-1).preventScroll, true);
+    ta2.blur(); fireDoc('focusout', ta2);
+});
+
+ok('debug : overlay créé / retiré', () => {
+    const s = t.getSettings();
+    s.debug = true; t.updateDebug();
+    const el = document.getElementById('fs_debug');
+    assert.ok(el); assert.match(el.textContent, /scrollY/);
+    s.debug = false; t.updateDebug();
+    assert.equal(document.getElementById('fs_debug'), null);
 });
 
 console.log(`\n${n} groupes OK`);
