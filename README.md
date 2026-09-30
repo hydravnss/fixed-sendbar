@@ -47,3 +47,19 @@ Si besoin, à coller dans *Custom CSS* de SillyTavern (repli sans JavaScript) :
 ## Licence
 
 MIT
+
+## Historique
+
+- **1.2.0** : **cause racine iOS trouvée en vrai SillyTavern 1.19 (release)**. Le coeur de ST pose `html{transform:translateZ(0);perspective:1000;backface-visibility:hidden}` ; avec un thème qui force `#form_sheld{position:fixed}` (ex. « iMessage Dark »), `<html>` (et tout wrapper avec `transform`/`will-change`/`filter`, ex. `#tjxv3p{transform:translateY(-12px)}`) devient le bloc conteneur du `fixed` : la barre n'est plus collée au viewport mais suit le **défilement du document**, que iOS déclenche à chaque saut de ligne quand le clavier est ouvert. Correctif : quand la barre est `fixed`, neutralisation (inline `!important`) de transform / perspective / filter / backdrop-filter / will-change / contain sur tous les ancêtres, report du `translateY` d'origine sur la barre (`--fs-anc-ty`), `field-sizing: fixed !important` sur le champ, sélecteurs plus spécifiques, `MutationObserver` qui rétablit le `top` inline si un autre script l'efface (ex. Sendbar Mover sur `resize`). Les versions 1.0.0/1.1.0 se chargeaient sans erreur mais ne traitaient pas cette cause.
+- **1.1.0** : mode iOS renforcé (ancrage visualViewport, contre-scroll, debug).
+- **1.0.0** : version initiale.
+
+## CSS de secours (à coller en DERNIER dans le CSS perso, sans l'extension)
+
+```css
+html,body,#sheld,#tjxv3p{transform:none!important;-webkit-transform:none!important;perspective:none!important;
+  backface-visibility:visible!important;filter:none!important;backdrop-filter:none!important;will-change:auto!important;contain:none!important}
+#form_sheld{position:fixed!important;bottom:0!important;left:0!important;right:0!important;transform:translateY(-12px)!important}
+#send_textarea{field-sizing:fixed!important;height:72px!important;min-height:72px!important;max-height:72px!important;
+  overflow-y:auto!important;resize:none!important}
+```

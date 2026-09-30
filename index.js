@@ -15,6 +15,10 @@
  *   visualViewport en coordonnées du layout viewport (top = offsetTop + height - hauteurBarre, bottom:auto, inline
  *   !important) ; boucle rAF (~60 fps) + événements ; la page est ramenée à scrollY = 0 ; retrait des overrides au blur.
  *
+ * 1.2.0 : CAUSE RACINE iOS — le CSS du coeur de ST `html{transform:translateZ(0);perspective:1000;backface-visibility:hidden}` fait de <html>
+ *   le bloc conteneur des position:fixed : avec un thème qui force #form_sheld{position:fixed}, la barre suit le défilement du document
+ *   (que iOS déclenche à chaque saut de ligne). Quand la barre est fixed, on neutralise ces propriétés sur <html> ET sur tous les ancêtres de la barre (classe fs-fixed + inline !important).
+ *
  * Vanilla ES module, aucune étape de build.
  * Chemin attendu : /scripts/extensions/third-party/fixed-sendbar/index.js
  */
@@ -31,6 +35,7 @@ const CLS_GUARD = 'fs-guard';
 const CLS_VV = 'fs-vv';
 const VV_EPSILON = 1; // px : en dessous, décalage considéré nul
 const CLS_IOS = 'fs-ios';
+const CLS_FIXED = 'fs-fixed'; // posée quand #form_sheld est position:fixed (thème) : neutralise le bloc conteneur créé par <html>
 const LOOP_MIN_MS = 15; // plafond ~60 fps pour la boucle rAF
 const DEBUG_ID = 'fs_debug';
 const SCROLL_GUARD_MS = 1500; // fenêtre après le focus pendant laquelle on surveille le scroll
@@ -183,9 +188,9 @@ function formatDebug(d) {
 function buildCss(s) {
     const spec = ':not(#fs_s1):not(#fs_s2)';
     const on = `html.${CLS_ON}`;
-    const ta = `html.${CLS_ON} body #send_textarea${spec}`;
+    const ta = `html.${CLS_ON} body #form_sheld #send_form #send_textarea${spec}, html.${CLS_ON} body #send_textarea${spec}`;
     const rules = [];
-    const common = 'scroll-padding:0 !important;resize:none !important;overflow-y:auto !important;overflow-x:hidden !important;'
+    const common = 'field-sizing:fixed !important;scroll-padding:0 !important;resize:none !important;overflow-y:auto !important;overflow-x:hidden !important;'
         + '-webkit-overflow-scrolling:touch;overscroll-behavior:contain;box-sizing:border-box !important;';
     if (s.mode === MODES.grow) {
         rules.push(`${ta} {min-height:var(--fs-min-h, 2em) !important;max-height:var(--fs-max-h, 9em) !important;${common}}`);
@@ -201,8 +206,18 @@ function buildCss(s) {
     // Mode iOS renforcé : pas de rebond / chaînage de scroll ; height:100% à spécificité 0 (:where) pour ne jamais écraser le thème / ST
     rules.push(`html.${CLS_ON}.${CLS_IOS}, html.${CLS_ON}.${CLS_IOS} body {overscroll-behavior:none !important;}`);
     rules.push(`:where(html.${CLS_ON}.${CLS_IOS}, html.${CLS_ON}.${CLS_IOS} body) {height:100%;}`);
+    // 1.2.0 : cause racine. ST pose `html{transform:translateZ(0);perspective:1000;backface-visibility:hidden}` : <html> devient le
+    // bloc conteneur des éléments position:fixed. Avec un thème qui force #form_sheld en fixed, la barre n'est donc PAS fixée au
+    // viewport mais à <html> : elle défile avec le document, et iOS fait défiler le document à chaque saut de ligne (clavier).
+    // On neutralise ces propriétés sur <html> (seulement si la barre est fixed) : fixed redevient vraiment relatif au viewport.
+    rules.push(`html.${CLS_ON}.${CLS_FIXED}, html.${CLS_ON}.${CLS_FIXED}:not(#fs_s1):not(#fs_s2) {transform:none !important;`
+        + '-webkit-transform:none !important;perspective:none !important;-webkit-perspective:none !important;'
+        + 'backface-visibility:visible !important;-webkit-backface-visibility:visible !important;'
+        + 'filter:none !important;will-change:auto !important;contain:none !important;}');
+    // Le décalage vertical d'origine des ancêtres (ex. wrapper translateY(-12px)) est reporté sur la barre
+    rules.push(`html.${CLS_ON}.${CLS_FIXED} body #form_sheld${spec} {transform:translateY(var(--fs-anc-ty, 0px)) !important;}`);
     // Décalage clavier iOS : uniquement quand la classe fs-vv est posée par index.js (barre fixed + offset > 0)
-    rules.push(`html.${CLS_ON}.${CLS_VV} body #form_sheld${spec} {transform:translateY(calc(-1 * var(--fs-vv-offset, 0px))) !important;}`);
+    rules.push(`html.${CLS_ON}.${CLS_VV} body #form_sheld${spec} {transform:translateY(calc(var(--fs-anc-ty, 0px) - var(--fs-vv-offset, 0px))) !important;}`);
     return rules.join('\n');
 }
 
@@ -298,7 +313,96 @@ function applyStyle() {
         r.classList.toggle(CLS_GROW, !!s.enabled && s.mode === MODES.grow);
         r.classList.toggle(CLS_GUARD, !!s.enabled && !!s.guardScroll);
         r.classList.toggle(CLS_IOS, !!s.enabled && !!s.iosStrong);
+        syncFixedClass();
     } catch (e) { console.error(LOG, e); }
+}
+
+/** Vrai si #form_sheld est position:fixed (thème « iMessage Dark »...). */
+function isSheldFixed() {
+    try {
+        const sheld = getSheld();
+        return !!sheld && getComputedStyle(sheld).position === 'fixed';
+    } catch (e) { return false; }
+}
+
+// Propriétés qui font d'un ancêtre le bloc conteneur des descendants position:fixed (le fixed ne suit alors plus le viewport).
+const CB_NEUTRAL = Object.freeze({
+    'transform': 'none', '-webkit-transform': 'none', 'perspective': 'none', '-webkit-perspective': 'none',
+    'filter': 'none', '-webkit-filter': 'none', 'backdrop-filter': 'none', '-webkit-backdrop-filter': 'none',
+    'will-change': 'auto', 'contain': 'none', 'container-type': 'normal',
+});
+const cbTouched = new Map(); // élément -> { saved: {prop: [valeur, priorité]}, ty: translateY d'origine }
+
+/** translateY (px) d'une matrice calculée « matrix(a,b,c,d,e,f) » / « matrix3d(...) » ; 0 si aucune. */
+function parseTranslateY(transform) {
+    const t = String(transform || '');
+    let m = /^matrix\(([^)]+)\)$/.exec(t);
+    if (m) { const f = Number(m[1].split(',')[5]); return Number.isFinite(f) ? f : 0; }
+    m = /^matrix3d\(([^)]+)\)$/.exec(t);
+    if (m) { const f = Number(m[1].split(',')[13]); return Number.isFinite(f) ? f : 0; }
+    return 0;
+}
+
+/** Cet ancêtre crée-t-il un bloc conteneur pour position:fixed ? (cs = getComputedStyle) */
+function createsFixedContainingBlock(cs) {
+    const no = (v) => !v || v === 'none' || v === 'auto' || v === 'normal';
+    if (!no(cs.transform) || !no(cs.perspective) || !no(cs.filter) || !no(cs.backdropFilter || cs.webkitBackdropFilter)) return true;
+    if (/(transform|perspective|filter)/.test(cs.willChange || '')) return true;
+    if (/(paint|layout|strict|content)/.test(cs.contain || '')) return true;
+    if (cs.containerType && cs.containerType !== 'normal' && /size|inline-size/.test(cs.containerType)) return true;
+    return false;
+}
+
+function releaseAncestors() {
+    for (const [el, info] of cbTouched) {
+        for (const p of Object.keys(CB_NEUTRAL)) {
+            const [val, prio] = info.saved[p] || ['', ''];
+            if (val) el.style.setProperty(p, val, prio || ''); else el.style.removeProperty(p);
+        }
+    }
+    cbTouched.clear();
+    root().style.removeProperty('--fs-anc-ty');
+}
+
+/**
+ * 1.2.0 (cause racine iOS) : quand #form_sheld est position:fixed (thème « iMessage Dark »), tout ancêtre (html, body, #sheld,
+ * wrapper du thème...) qui a transform / perspective / filter / backdrop-filter / will-change / contain en devient le bloc
+ * conteneur : la barre suit alors le DÉFILEMENT DU DOCUMENT (que iOS déclenche à chaque saut de ligne) au lieu du viewport.
+ * On neutralise ces propriétés sur les ancêtres (inline !important, donc plus fort que n'importe quel thème) et on reporte le
+ * translateY d'origine sur la barre elle-même (variable --fs-anc-ty) pour garder le décalage visuel voulu (ex. -12px).
+ * Classe fs-fixed sur <html> tant que c'est actif. Retourne true si l'état a changé.
+ */
+function syncFixedClass() {
+    try {
+        const s = getSettings();
+        const r = root();
+        const sheld = getSheld();
+        const want = !!s.enabled && !!sheld && isSheldFixed();
+        const had = r.classList.contains(CLS_FIXED);
+        if (!want) {
+            if (had) r.classList.remove(CLS_FIXED);
+            if (cbTouched.size) releaseAncestors();
+            return had !== want;
+        }
+        if (!had) r.classList.add(CLS_FIXED);
+        for (let el = sheld.parentElement; el; el = el.parentElement) {
+            let info = cbTouched.get(el);
+            if (!info) {
+                if (!createsFixedContainingBlock(getComputedStyle(el))) continue;
+                info = { saved: {}, ty: parseTranslateY(getComputedStyle(el).transform) };
+                for (const p of Object.keys(CB_NEUTRAL)) info.saved[p] = [el.style.getPropertyValue(p), el.style.getPropertyPriority(p)];
+                cbTouched.set(el, info);
+            }
+            for (const [p, v] of Object.entries(CB_NEUTRAL)) {
+                if (el.style.getPropertyValue(p) !== v || el.style.getPropertyPriority(p) !== 'important') el.style.setProperty(p, v, 'important');
+            }
+        }
+        let ty = 0;
+        for (const info of cbTouched.values()) ty += info.ty;
+        const want_ty = `${Math.round(ty * 10) / 10}px`;
+        if (r.style.getPropertyValue('--fs-anc-ty') !== want_ty) r.style.setProperty('--fs-anc-ty', want_ty);
+        return had !== want;
+    } catch (e) { console.error(LOG, 'syncFixedClass a échoué', e); return false; }
 }
 
 function setHeight(ta, h) {
@@ -348,6 +452,7 @@ function releaseHeight() {
     for (const v of ['--fs-h', '--fs-min-h', '--fs-max-h', '--fs-vv-offset']) r.style.removeProperty(v);
     r.classList.remove(CLS_VV);
     r.classList.remove(CLS_IOS);
+    syncFixedClass(); // enabled=false => retire fs-fixed et les overrides inline de <html>
     releaseAnchor();
     stopLoop();
     updateDebug();
@@ -361,6 +466,25 @@ function observeTextarea() {
     // ST (autoFitSendTextArea) modifie style.height : on le rétablit aussitôt, avant le rendu.
     observer = new MutationObserver(() => { if (!enforcing && getSettings().enabled) enforce(); });
     observer.observe(ta, { attributes: true, attributeFilter: ['style', 'rows'] });
+}
+
+// Un autre script (ex. sendbar-mover, sur 'resize') peut effacer notre top/bottom inline : on le rétablit avant le rendu
+// (sinon la barre s'étire d'une image sur toute la hauteur : top fixé + bottom:0 du thème).
+let sheldObserver = null;
+let observedSheld = null;
+function observeSheld() {
+    const sheld = getSheld();
+    if (!sheld || sheld === observedSheld || typeof MutationObserver === 'undefined') return;
+    if (sheldObserver) sheldObserver.disconnect();
+    observedSheld = sheld;
+    sheldObserver = new MutationObserver(() => {
+        if (anchored && isFocused()) {
+            const want = `${anchorTop}px`;
+            const st = sheld.style;
+            if (st.getPropertyValue('top') !== want || st.getPropertyValue('bottom') !== 'auto') updateAnchor();
+        }
+    });
+    sheldObserver.observe(sheld, { attributes: true, attributeFilter: ['style'] });
 }
 
 // --- iOS : visualViewport ---------------------------------------------------
@@ -455,6 +579,7 @@ function updateAnchor() {
         const vv = globalThis.visualViewport;
         const sheld = getSheld();
         const focused = isFocused();
+        syncFixedClass();
         if (!(s.enabled && s.iosStrong && focused && sheld && vv)) {
             releaseAnchor();
             lastGap = 0;
@@ -593,6 +718,7 @@ function updateDebug() {
 function refreshAll() {
     applyStyle();
     observeTextarea();
+    observeSheld();
     enforce();
     scheduleVv();
     installScrollPatches();
@@ -809,6 +935,7 @@ function init() {
         mountSettings();
         bindListeners();
         observeTextarea();
+        observeSheld();
         enforce();
         updateVv();
         installScrollPatches();
@@ -841,6 +968,6 @@ export const __test = {
     MODES, defaultSettings, clampNumber, parseLineHeight, heightForLines, computeFixedHeight, computeGrowHeight,
     computeTargetHeight, computeVvOffset, shouldApplyVv, shouldResetScroll, buildCss, braceBalance,
     computeAnchorTop, computeAnchor, shouldCounterScroll, shouldStickBottom, shouldBlockScroll, formatDebug,
-    getSettings, applyStyle, enforce, updateVv, observeTextarea, releaseHeight,
+    getSettings, applyStyle, syncFixedClass, isSheldFixed, parseTranslateY, createsFixedContainingBlock, enforce, updateVv, observeTextarea, releaseHeight,
     updateAnchor, releaseAnchor, resetPageScroll, keepCaretVisible, installScrollPatches, updateDebug, startLoop, stopLoop,
 };
